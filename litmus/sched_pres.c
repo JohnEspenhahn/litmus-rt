@@ -448,7 +448,8 @@ static long do_pres_reservation_create(
 			break;
 
 		case TABLE_DRIVEN:
-			err = alloc_table_driven_reservation(config, &new_res);
+		case TABLE_DRIVEN_SS:
+			err = alloc_table_driven_reservation(res_type, config, &new_res);
 			break;
 
 		default:

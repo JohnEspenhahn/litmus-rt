@@ -3,9 +3,26 @@
 #include <litmus/litmus.h>
 #include <litmus/reservations/reservation.h>
 #include <litmus/reservations/table-driven.h>
+#include <litmus/reservations/table-driven-ss.h>
 #include <litmus/reservations/table-driven-common.h>
 
-static void td_client_arrives(
+static void update_execution_cost(
+	struct table_driven_reservation *tdres) 
+{
+	struct reservation_client *client, *next;
+
+	/* Sum non-aperiodic exec_costs */
+	lt_t exec_cost_total = 0;
+	list_for_each_entry_safe(client, next, &tdres->res.clients, list) {
+		struct task_client *tc = container_of(client, struct task_client, client);
+		lt_t exec_cost = tsk_rt(tc->task)->task_params.exec_cost;
+		exec_cost_total += exec_cost;
+	}
+	
+	tdres->expected_exec_cost = exec_cost_total;
+}
+
+static void td_ss_client_arrives(
 	struct reservation* res,
 	struct reservation_client *client
 )
@@ -13,7 +30,17 @@ static void td_client_arrives(
 	struct table_driven_reservation *tdres =
 		container_of(res, struct table_driven_reservation, res);
 
-	list_add_tail(&client->list, &res->clients);
+	struct task_client *tc = container_of(client, struct task_client, client);
+	task_class_t class = tsk_rt(tc->task)->task_params.cls;
+	TRACE("td_ss_client_arrives: task class is %d\n", class);
+
+	if (class == RT_CLASS_BEST_EFFORT) {
+		list_add_tail(&client->list, &tdres->aperiodic_clients);
+	} else {
+		list_add_tail(&client->list, &res->clients);
+	}
+
+	update_execution_cost(tdres);
 
 	switch (res->state) {
 		case RESERVATION_INACTIVE:
@@ -39,13 +66,18 @@ static void td_client_arrives(
 	}
 }
 
-static void td_client_departs(
+static void td_ss_client_departs(
 	struct reservation *res,
 	struct reservation_client *client,
 	int did_signal_job_completion
 )
 {
+	struct table_driven_reservation *tdres =
+		container_of(res, struct table_driven_reservation, res);
+
 	list_del(&client->list);
+
+	update_execution_cost(tdres);
 
 	switch (res->state) {
 		case RESERVATION_INACTIVE:
@@ -54,7 +86,7 @@ static void td_client_departs(
 			break;
 
 		case RESERVATION_ACTIVE:
-			if (list_empty(&res->clients)) {
+			if (list_empty(&res->clients) && list_empty(&tdres->aperiodic_clients)) {
 				res->env->change_state(res->env, res,
 						RESERVATION_ACTIVE_IDLE);
 			} /* else: nothing to do, more clients ready */
@@ -66,13 +98,13 @@ static void td_client_departs(
 	}
 }
 
-static void td_replenish(
+static void td_ss_replenish(
 	struct reservation *res)
 {
 	struct table_driven_reservation *tdres =
 		container_of(res, struct table_driven_reservation, res);
 
-	TRACE("td_replenish(%u): expected_replenishment=%llu\n", res->id,
+	TRACE("td_ss_replenish(%u): expected_replenishment=%llu\n", res->id,
 		res->next_replenishment);
 
 	/* figure out current interval */
@@ -88,8 +120,14 @@ static void td_replenish(
 	/* reset budget */
 	res->cur_budget = td_time_remaining_until_end(tdres);
 	res->budget_consumed = 0;
-	TRACE("td_replenish(%u): %s budget=%llu\n", res->id,
+	TRACE("td_ss_replenish(%u): %s budget=%llu\n", res->id,
 		res->cur_budget ? "" : "WARNING", res->cur_budget);
+
+	/* reset slack */
+	tdres->slack_consumed = 0;
+	tdres->cur_slack = res->cur_budget - tdres->expected_exec_cost;
+	TRACE("td_ss_replenish(%u): %s slack=%llu\n", res->id,
+		tdres->cur_slack ? "" : "WARNING", tdres->cur_slack);
 
 	/* prepare next slot */
 	tdres->next_interval = (tdres->next_interval + 1) % tdres->num_intervals;
@@ -100,7 +138,7 @@ static void td_replenish(
 	/* determine next time this reservation becomes eligible to execute */
 	res->next_replenishment  = tdres->major_cycle_start;
 	res->next_replenishment += tdres->intervals[tdres->next_interval].start;
-	TRACE("td_replenish(%u): next_replenishment=%llu\n", res->id,
+	TRACE("td_ss_replenish(%u): next_replenishment=%llu\n", res->id,
 		res->next_replenishment);
 
 
@@ -108,7 +146,7 @@ static void td_replenish(
 		case RESERVATION_DEPLETED:
 		case RESERVATION_ACTIVE:
 		case RESERVATION_ACTIVE_IDLE:
-			if (list_empty(&res->clients))
+			if (list_empty(&res->clients) && list_empty(&tdres->aperiodic_clients))
 				res->env->change_state(res->env, res,
 					RESERVATION_ACTIVE_IDLE);
 			else
@@ -123,7 +161,7 @@ static void td_replenish(
 	}
 }
 
-static void td_drain_budget(
+static void td_ss_drain_budget(
 		struct reservation *res,
 		lt_t how_much)
 {
@@ -148,7 +186,7 @@ static void td_drain_budget(
 		case RESERVATION_ACTIVE_IDLE:
 		case RESERVATION_ACTIVE:
 			res->cur_budget = td_time_remaining_until_end(tdres);
-			TRACE("td_drain_budget(%u): drained to budget=%llu\n",
+			TRACE("td_ss_drain_budget(%u): drained to budget=%llu\n",
 				res->id, res->cur_budget);
 			if (!res->cur_budget) {
 				res->env->change_state(res->env, res,
@@ -163,7 +201,36 @@ static void td_drain_budget(
 	}
 }
 
-static struct task_struct* td_dispatch_client(
+struct task_struct* dispatch_aperiodic_client(
+	struct table_driven_reservation *tdres,
+	lt_t *for_at_most)
+{
+	struct reservation_client *client, *next;
+	struct task_struct* tsk;
+
+	BUG_ON(tdres->res.state != RESERVATION_ACTIVE);
+
+	/* limit based on current slack */
+	*for_at_most = tdres->cur_slack;
+
+	list_for_each_entry_safe(client, next, &tdres->aperiodic_clients, list) {
+		tsk = client->dispatch(client);
+		if (likely(tsk)) {
+			/* Primitive form of round-robin scheduling: same as default_dispatch_client */
+			list_del(&client->list);
+			/* move to back of list */
+			list_add_tail(&client->list, &tdres->aperiodic_clients);
+
+			/* Track worst-case usage of slack as consumed */
+			tdres->slack_consumed += tsk_rt(tsk)->task_params.exec_cost;
+
+			return tsk;
+		}
+	}
+	return NULL;
+}
+
+static struct task_struct* td_ss_dispatch_client(
 	struct reservation *res,
 	lt_t *for_at_most)
 {
@@ -171,16 +238,26 @@ static struct task_struct* td_dispatch_client(
 	struct table_driven_reservation *tdres =
 		container_of(res, struct table_driven_reservation, res);
 
-	/* usual logic for selecting a client */
-	t = default_dispatch_client(res, for_at_most);
+	lt_t remaining_exec_cost;
 
-	TRACE_TASK(t, "td_dispatch_client(%u): selected, budget=%llu\n",
-		res->id, res->cur_budget);
+	/* check how much slack we have left in this time slot, before deciding who to dispatch */
+	remaining_exec_cost = tdres->expected_exec_cost - res->budget_consumed;
+	tdres->cur_slack = (res->cur_budget - remaining_exec_cost) - tdres->slack_consumed;
+
+	/* if there is slack available, dispatch an aperiodic client */
+	if (tdres->cur_slack > 1) {
+		t = dispatch_aperiodic_client(tdres, for_at_most);
+	} else {
+		t = default_dispatch_client(res, for_at_most);
+	}
+
+	TRACE_TASK(t, "td_ss_dispatch_client(%u): selected, budget=%llu slack=%llu\n",
+		res->id, res->cur_budget, tdres->cur_slack);
 
 	/* check how much budget we have left in this time slot */
 	res->cur_budget = td_time_remaining_until_end(tdres);
 
-	TRACE_TASK(t, "td_dispatch_client(%u): updated to budget=%llu next=%d\n",
+	TRACE_TASK(t, "td_ss_dispatch_client(%u): updated to budget=%llu next=%d\n",
 		res->id, res->cur_budget, tdres->next_interval);
 
 	if (unlikely(!res->cur_budget)) {
@@ -189,7 +266,7 @@ static struct task_struct* td_dispatch_client(
 		 * Not much we can do about this, but we can't dispatch a job
 		 * now without causing overload. So let's register this reservation
 		 * as depleted and wait for the next allocation. */
-		TRACE("td_dispatch_client(%u): budget unexpectedly depleted "
+		TRACE("td_ss_dispatch_client(%u): budget unexpectedly depleted "
 			"(check scheduling table for unintended overlap)\n",
 			res->id);
 		res->env->change_state(res->env, res,
@@ -199,36 +276,27 @@ static struct task_struct* td_dispatch_client(
 		return t;
 }
 
-static struct reservation_ops td_ops = {
-	.dispatch_client = td_dispatch_client,
-	.client_arrives = td_client_arrives,
-	.client_departs = td_client_departs,
-	.replenish = td_replenish,
-	.drain_budget = td_drain_budget,
+static struct reservation_ops td_ss_ops = {
+	.dispatch_client = td_ss_dispatch_client,
+	.client_arrives = td_ss_client_arrives,
+	.client_departs = td_ss_client_departs,
+	.replenish = td_ss_replenish,
+	.drain_budget = td_ss_drain_budget,
 };
 
-void table_driven_reservation_init(
-	struct table_driven_reservation *tdres,
+void table_driven_reservation_ss_init(
+	struct table_driven_reservation *tdres_ss,
 	lt_t major_cycle,
 	struct lt_interval *intervals,
 	unsigned int num_intervals)
 {
-	unsigned int i;
+	table_driven_reservation_init(tdres_ss, major_cycle, intervals, num_intervals);
 
-	/* sanity checking */
-	BUG_ON(!num_intervals);
-	for (i = 0; i < num_intervals; i++)
-		BUG_ON(intervals[i].end <= intervals[i].start);
-	for (i = 0; i + 1 < num_intervals; i++)
-		BUG_ON(intervals[i + 1].start <= intervals[i].end);
-	BUG_ON(intervals[num_intervals - 1].end > major_cycle);
+	tdres_ss->res.kind = TABLE_DRIVEN_SS;
+	tdres_ss->res.ops = &td_ss_ops;
 
-	reservation_init(&tdres->res);
-	tdres->res.kind = TABLE_DRIVEN;
-	tdres->major_cycle = major_cycle;
-	tdres->intervals = intervals;
-	tdres->cur_interval.start = 0;
-	tdres->cur_interval.end   = 0;
-	tdres->num_intervals = num_intervals;
-	tdres->res.ops = &td_ops;
+	tdres_ss->expected_exec_cost = 0;
+	tdres_ss->slack_consumed = 0;
+	tdres_ss->cur_slack = 0;
+	INIT_LIST_HEAD(&tdres_ss->aperiodic_clients);
 }

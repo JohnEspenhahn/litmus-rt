@@ -78,6 +78,7 @@ typedef enum {
 	PERIODIC_POLLING = 10,
 	SPORADIC_POLLING,
 	TABLE_DRIVEN,
+	TABLE_DRIVEN_SS
 } reservation_type_t;
 
 struct lt_interval {

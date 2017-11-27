@@ -9,6 +9,7 @@ long alloc_polling_reservation(
 	struct reservation **_res);
 
 long alloc_table_driven_reservation(
+	int res_type,
 	struct reservation_config *config,
 	struct reservation **_res);
 

@@ -15,6 +15,13 @@ struct table_driven_reservation {
 	/* info about current scheduling slot */
 	struct lt_interval cur_interval;
 	lt_t major_cycle_start;
+
+	/* used by slack stealing ONLY */
+	lt_t expected_exec_cost;
+	lt_t slack_consumed;
+	lt_t cur_slack;
+
+	struct list_head aperiodic_clients;
 };
 
 void table_driven_reservation_init(struct table_driven_reservation *tdres,

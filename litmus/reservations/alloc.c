@@ -6,7 +6,7 @@
 #include <litmus/reservations/alloc.h>
 #include <litmus/reservations/polling.h>
 #include <litmus/reservations/table-driven.h>
-
+#include <litmus/reservations/table-driven-ss.h>
 
 long alloc_polling_reservation(
 	int res_type,
@@ -59,6 +59,7 @@ long alloc_polling_reservation(
 #define MAX_INTERVALS 1024
 
 long alloc_table_driven_reservation(
+	int res_type,
 	struct reservation_config *config,
 	struct reservation **_res)
 {
@@ -68,6 +69,8 @@ long alloc_table_driven_reservation(
 	unsigned int i, num_slots;
 	long err = -EINVAL;
 	void *mem;
+
+	int slack_steal =  res_type == TABLE_DRIVEN_SS;
 
 	if (!config->table_driven_params.num_intervals) {
 		printk(KERN_ERR "invalid table-driven reservation (%u): "
@@ -130,11 +133,18 @@ long alloc_table_driven_reservation(
 	if (err) {
 		kfree(td_res);
 	} else {
-		table_driven_reservation_init(td_res,
-			config->table_driven_params.major_cycle_length,
-			slots, num_slots);
+		if (slack_steal) {
+			table_driven_reservation_ss_init(td_res,
+				config->table_driven_params.major_cycle_length,
+				slots, num_slots);
+		} else {
+			table_driven_reservation_init(td_res,
+				config->table_driven_params.major_cycle_length,
+				slots, num_slots);
+		}
 		td_res->res.id = config->id;
 		td_res->res.priority = config->priority;
+
 		*_res = &td_res->res;
 	}
 

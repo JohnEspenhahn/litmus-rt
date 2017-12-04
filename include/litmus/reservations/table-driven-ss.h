@@ -6,6 +6,7 @@
 
 void table_driven_reservation_ss_init(
 	struct table_driven_reservation *tdres,
+	struct list_head *aperiodic_clients,
 	lt_t major_cycle, struct lt_interval *intervals, unsigned int num_intervals);
 
 #endif

@@ -440,6 +440,9 @@ static long do_pres_reservation_create(
 	unsigned long flags;
 	long err;
 
+	state = cpu_state_for(config->cpu);
+	raw_spin_lock_irqsave(&state->lock, flags);
+
 	/* Allocate before we grab a spin lock. */
 	switch (res_type) {
 		case PERIODIC_POLLING:
@@ -449,7 +452,7 @@ static long do_pres_reservation_create(
 
 		case TABLE_DRIVEN:
 		case TABLE_DRIVEN_SS:
-			err = alloc_table_driven_reservation(res_type, config, &new_res);
+			err = alloc_table_driven_reservation(res_type, &state->sup_env, config, &new_res);
 			break;
 
 		default:
@@ -459,9 +462,6 @@ static long do_pres_reservation_create(
 
 	if (err)
 		return err;
-
-	state = cpu_state_for(config->cpu);
-	raw_spin_lock_irqsave(&state->lock, flags);
 
 	res = sup_find_by_id(&state->sup_env, config->id);
 	if (!res) {

@@ -25,11 +25,15 @@ lt_t td_time_remaining_until_end(struct table_driven_reservation *tdres)
 {
 	lt_t now = tdres->res.env->current_time;
 	lt_t end = tdres->cur_interval.end;
+	
+	/*
 	TRACE("td_remaining(%u): start=%llu now=%llu end=%llu state=%d\n",
 		tdres->res.id,
 		tdres->cur_interval.start,
 		now, end,
 		tdres->res.state);
+	*/
+
 	if (now >=  end)
 		return 0;
 	else

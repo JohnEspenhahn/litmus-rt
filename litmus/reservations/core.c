@@ -385,6 +385,7 @@ void sup_init(struct sup_reservation_environment* sup_env)
 	INIT_LIST_HEAD(&sup_env->active_reservations);
 	INIT_LIST_HEAD(&sup_env->depleted_reservations);
 	INIT_LIST_HEAD(&sup_env->inactive_reservations);
+	INIT_LIST_HEAD(&sup_env->shared_clients);
 
 	sup_env->env.change_state = sup_res_change_state;
 	sup_env->env.request_replenishment = sup_request_replenishment;

@@ -195,6 +195,9 @@ struct sup_reservation_environment {
 	/* list of all reservations */
 	struct list_head all_reservations;
 
+	/* list of shared, aperiodic clients */
+	struct list_head shared_clients;
+
 	/* - SUP_RESCHEDULE_NOW means call sup_dispatch() now
 	 * - SUP_NO_SCHEDULER_UPDATE means nothing to do
 	 * any other value means program a timer for the given time

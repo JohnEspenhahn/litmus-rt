@@ -21,7 +21,7 @@ struct table_driven_reservation {
 	lt_t slack_consumed;
 	lt_t cur_slack;
 
-	struct list_head aperiodic_clients;
+	struct list_head *aperiodic_clients;
 };
 
 void table_driven_reservation_init(struct table_driven_reservation *tdres,

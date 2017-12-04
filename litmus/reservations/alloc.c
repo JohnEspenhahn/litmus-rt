@@ -5,6 +5,7 @@
 
 #include <litmus/reservations/alloc.h>
 #include <litmus/reservations/polling.h>
+#include <litmus/reservations/reservation.h>
 #include <litmus/reservations/table-driven.h>
 #include <litmus/reservations/table-driven-ss.h>
 
@@ -60,6 +61,7 @@ long alloc_polling_reservation(
 
 long alloc_table_driven_reservation(
 	int res_type,
+	struct sup_reservation_environment *sup_env,
 	struct reservation_config *config,
 	struct reservation **_res)
 {
@@ -135,6 +137,7 @@ long alloc_table_driven_reservation(
 	} else {
 		if (slack_steal) {
 			table_driven_reservation_ss_init(td_res,
+				&sup_env->shared_clients,
 				config->table_driven_params.major_cycle_length,
 				slots, num_slots);
 		} else {

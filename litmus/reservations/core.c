@@ -2,6 +2,7 @@
 
 #include <litmus/litmus.h>
 #include <litmus/debug_trace.h>
+#include <litmus/reservations/core.h>
 #include <litmus/reservations/reservation.h>
 
 void reservation_init(struct reservation *res)
@@ -89,8 +90,12 @@ static void sup_scheduler_update_at(
 	struct sup_reservation_environment* sup_env,
 	lt_t when)
 {
-	if (sup_env->next_scheduler_update > when)
+	if (sup_env->next_scheduler_update > when) {
+		TRACE("prev_scheduler_update %llu -> next_scheduler_update %llu at time %llu\n", 
+			sup_env->next_scheduler_update, when, sup_env->env.current_time);
+		
 		sup_env->next_scheduler_update = when;
+	}
 }
 
 static void sup_scheduler_update_after(
@@ -98,6 +103,15 @@ static void sup_scheduler_update_after(
 	lt_t timeout)
 {
 	sup_scheduler_update_at(sup_env, sup_env->env.current_time + timeout);
+}
+
+void env_scheduler_update_after(
+	struct reservation_environment* env,
+	lt_t timeout)
+{
+	struct sup_reservation_environment* sup_env;
+	sup_env = container_of(env, struct sup_reservation_environment, env);
+	sup_scheduler_update_after(sup_env, timeout);
 }
 
 static int _sup_queue_depleted(
@@ -302,8 +316,10 @@ void sup_update_time(
 	sup_env->env.current_time = now;
 
 	/* check if future updates are required */
-	if (sup_env->next_scheduler_update <= sup_env->env.current_time)
+	if (sup_env->next_scheduler_update <= sup_env->env.current_time) {
+		TRACE("deleting next_scheduler_update %llu at time %llu\n", sup_env->next_scheduler_update, sup_env->env.current_time);
 		sup_env->next_scheduler_update = SUP_NO_SCHEDULER_UPDATE;
+	}
 
 	/* deplete budgets by passage of time */
 	sup_charge_budget(sup_env, delta);

@@ -1,6 +1,10 @@
 #include <linux/sched.h>
 
+#include <litmus/jobs.h>
 #include <litmus/litmus.h>
+#include <litmus/preempt.h>
+#include <litmus/sched_plugin.h>
+#include <litmus/reservations/core.h>
 #include <litmus/reservations/reservation.h>
 #include <litmus/reservations/table-driven.h>
 #include <litmus/reservations/table-driven-ss.h>
@@ -19,8 +23,11 @@ static void update_execution_cost(
 		exec_cost_total += exec_cost;
 	}
 	
-	tdres->expected_exec_cost = exec_cost_total;
-	TRACE("update_execution_cost: Expected exec cost of %llu\n", exec_cost_total);
+	/* Sanity check: execution cost should not be zero if there are any real-time tasks */
+	BUG_ON(exec_cost_total == list_empty(&tdres->res.clients) ? -1 : 0);
+
+	tdres->expected_exec_cost = max(tdres->expected_exec_cost, exec_cost_total);
+	TRACE("update_execution_cost: Expected exec cost of %llu\n", tdres->expected_exec_cost);
 }
 
 static void td_ss_client_arrives(
@@ -45,9 +52,9 @@ static void td_ss_client_arrives(
 		TRACE_TASK(t, "td_ss_client_arrives: %s Adding normal client with exec_cost %llu\n", 
 			!exec_cost ? "WARNING" : "", exec_cost);
 		list_add_tail(&client->list, &res->clients);
-	}
 
-	update_execution_cost(tdres);
+		update_execution_cost(tdres);
+	}
 
 	switch (res->state) {
 		case RESERVATION_INACTIVE:
@@ -125,13 +132,17 @@ static void td_ss_replenish(
 	/* reset budget */
 	res->cur_budget = td_time_remaining_until_end(tdres);
 	res->budget_consumed = 0;
-	TRACE("td_ss_replenish(%u): %s budget=%llu\n", res->id,
+	TRACE("td_ss_replenish(%u): %s budget = %llu\n", res->id,
 		res->cur_budget ? "" : "WARNING", res->cur_budget);
 
 	/* reset slack */
+	tdres->running_slack = 0;
 	tdres->slack_consumed = 0;
-	tdres->cur_slack = res->cur_budget - tdres->expected_exec_cost;
-	TRACE("td_ss_replenish(%u): %s slack=%llu\n", res->id,
+	if (res->cur_budget < tdres->expected_exec_cost)
+		tdres->cur_slack = 0;
+	else
+		tdres->cur_slack = res->cur_budget - tdres->expected_exec_cost;
+	TRACE("td_ss_replenish(%u): %s slack  = %llu\n", res->id,
 		tdres->cur_slack ? "" : "WARNING", tdres->cur_slack);
 
 	/* prepare next slot */
@@ -192,10 +203,8 @@ static void td_ss_drain_budget(
 		case RESERVATION_ACTIVE:
 			res->cur_budget = td_time_remaining_until_end(tdres);
 
-			/*
-			TRACE("td_ss_drain_budget(%u): drained to budget=%llu\n",
+			TRACE("td_ss_drain_budget(%u): drained to budget = %llu\n",
 				res->id, res->cur_budget);
-			*/
 
 			if (!res->cur_budget) {
 				res->env->change_state(res->env, res,
@@ -204,6 +213,22 @@ static void td_ss_drain_budget(
 				/* sanity check budget calculation */
 				BUG_ON(res->env->current_time >= tdres->cur_interval.end);
 				BUG_ON(res->env->current_time < tdres->cur_interval.start);
+
+				/* slack checking */
+				if (tdres->running_slack) {
+					tdres->slack_consumed += how_much;
+					if (how_much >= tdres->running_slack) {
+						/* running_slack depleted, preempt until end of interval */
+						tdres->running_slack = 0;
+					} else {
+						tdres->running_slack -= how_much;
+					}
+
+					TRACE("td_ss_drain_budget(%u): drained to running slack  = %llu\n",
+							res->id, tdres->running_slack);
+
+					env_scheduler_update_after(res->env, tdres->running_slack);
+				}
 			}
 
 			break;
@@ -224,7 +249,7 @@ struct task_struct* dispatch_aperiodic_client(
 
 	list_for_each_entry_safe(client, next, tdres->aperiodic_clients, list) {
 		/* switch the reservation the client is running on
-		   reservations are disjoin so this is ok */
+		   reservations are disjoint so this is ok */
 		client->reservation = &tdres->res;
 		tsk = client->dispatch(client);
 		if (likely(tsk)) {
@@ -234,7 +259,9 @@ struct task_struct* dispatch_aperiodic_client(
 			list_add_tail(&client->list, tdres->aperiodic_clients);
 
 			/* Track worst-case usage of slack as consumed */
-			tdres->slack_consumed += tdres->cur_slack; // tsk_rt(tsk)->task_params.exec_cost; // exec_cost isn't actually provided
+			tdres->running_slack = tdres->cur_slack;
+			TRACE_TASK(tsk, "td_ss_dispatch_client: dispatching aperiodic client with slack %llu on reservation %d at time %llu\n", 
+				tdres->running_slack, tdres->res.id, tdres->res.env->current_time);
 
 			return tsk;
 		}
@@ -245,9 +272,9 @@ struct task_struct* dispatch_aperiodic_client(
 static struct task_struct* td_ss_dispatch_client(
 	struct reservation *res,
 	lt_t *for_at_most)
-{
-	lt_t remaining_exec_cost;
-	
+{	
+	lt_t budget, execution;
+
 	struct task_struct *t;
 	struct table_driven_reservation *tdres =
 		container_of(res, struct table_driven_reservation, res);
@@ -256,14 +283,16 @@ static struct task_struct* td_ss_dispatch_client(
 	res->cur_budget = td_time_remaining_until_end(tdres);
 
 	/* check how much slack we have left in this time slot, before deciding who to dispatch */
-	remaining_exec_cost = tdres->expected_exec_cost - res->budget_consumed;
-	tdres->cur_slack = (res->cur_budget - remaining_exec_cost) - tdres->slack_consumed;
+	budget = res->cur_budget + res->budget_consumed;
+	execution = tdres->expected_exec_cost + tdres->slack_consumed;
+	if (execution > budget) tdres->cur_slack = 0;
+	else tdres->cur_slack = budget - execution;
+	
 	TRACE("td_ss_dispatch_client: updated slack %llu\n", tdres->cur_slack);
 
 	/* if there is slack available, dispatch an aperiodic client */
 	if (tdres->cur_slack > 1 && !list_empty(tdres->aperiodic_clients)) {
 		t = dispatch_aperiodic_client(tdres, for_at_most);
-		TRACE_TASK(t, "td_ss_dispatch_client: dispatching aperiodic client with slack %llu\n", tdres->cur_slack);
 	} else {
 		t = default_dispatch_client(res, for_at_most);
 		TRACE_TASK(t, "td_ss_dispatch_client: dispatching normal client\n");
@@ -315,6 +344,7 @@ void table_driven_reservation_ss_init(
 
 	tdres_ss->expected_exec_cost = 0;
 	tdres_ss->slack_consumed = 0;
+	tdres_ss->running_slack = 0;
 	tdres_ss->cur_slack = 0;
 
 	// all reservations on the same core share the same aperiodic queue

@@ -19,6 +19,7 @@ struct table_driven_reservation {
 	/* used by slack stealing ONLY */
 	lt_t expected_exec_cost;
 	lt_t slack_consumed;
+	lt_t running_slack;
 	lt_t cur_slack;
 
 	struct list_head *aperiodic_clients;
